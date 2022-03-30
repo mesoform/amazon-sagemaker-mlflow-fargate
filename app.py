@@ -49,8 +49,8 @@ class DeploymentStack(Stack):
         # ==================================================
         # ==================== VPC =========================
         # ==================================================
-        public_subnet = ec2.SubnetConfiguration(name='Public', subnet_type=ec2.SubnetType.PUBLIC, cidr_mask=28)
-        private_subnet = ec2.SubnetConfiguration(name='Private', subnet_type=ec2.SubnetType.PRIVATE_WITH_NAT, cidr_mask=28)
+        # public_subnet = ec2.SubnetConfiguration(name='Public', subnet_type=ec2.SubnetType.PUBLIC, cidr_mask=28)
+        private_subnet = ec2.SubnetConfiguration(name='Private', subnet_type=ec2.SubnetType.PRIVATE_ISOLATED, cidr_mask=28)
         isolated_subnet = ec2.SubnetConfiguration(name='DB', subnet_type=ec2.SubnetType.PRIVATE_ISOLATED, cidr_mask=28)
 
         vpc = ec2.Vpc(
@@ -58,11 +58,48 @@ class DeploymentStack(Stack):
             id='VPC',
             cidr='10.0.0.0/24',
             max_azs=2,
-            nat_gateway_provider=ec2.NatProvider.gateway(),
-            nat_gateways=1,
-            subnet_configuration=[public_subnet, private_subnet, isolated_subnet]
+            nat_gateways=0,
+            subnet_configuration=[private_subnet, isolated_subnet]
         )
+        # ==================================================
+        # ==================== Sagemaker Config =========================
+        # ==================================================
+        sg_sagemaker = ec2.SecurityGroup(scope=self, id='SGSAGEMAKER', vpc=vpc, security_group_name='sg_sagemaker')
+        # NFS traffic
+        sg_sagemaker.add_ingress_rule(peer=ec2.Peer.ipv4('10.0.0.0/24'), connection=ec2.Port.tcp(2049))
+        # All TCP traffic within security group
+        sg_sagemaker.add_ingress_rule(peer=sg_sagemaker, connection=ec2.Port.tcp(-1))
+
+        vpc.add_interface_endpoint('SagemakerAPIEndpoint',
+                                   service=ec2.InterfaceVpcEndpointAwsService.SAGEMAKER_API,
+                                   private_dns_enabled=True)
+        vpc.add_interface_endpoint('SagemakerRuntimeEndpoint',
+                                   service=ec2.InterfaceVpcEndpointAwsService.SAGEMAKER_RUNTIME,
+                                   private_dns_enabled=True)
+        vpc.add_interface_endpoint('SagemakerNotebookEndpoint',
+                                   service=ec2.InterfaceVpcEndpointAwsService.SAGEMAKER_NOTEBOOK,
+                                   private_dns_enabled=True)
+        vpc.add_interface_endpoint('STSEndpoint',
+                                   service=ec2.InterfaceVpcEndpointAwsService.STS,
+                                   private_dns_enabled=True)
+        vpc.add_interface_endpoint('SSMEndpoint',
+                                   service=ec2.InterfaceVpcEndpointAwsService.SSM,
+                                   private_dns_enabled=True)
+        vpc.add_interface_endpoint('MonitoringEndpoint',
+                                   service=ec2.InterfaceVpcEndpointAwsService('monitoring'),
+                                   private_dns_enabled=True)
+        vpc.add_interface_endpoint('LogsEndpoint',
+                                   service=ec2.InterfaceVpcEndpointAwsService('logs'),
+                                   private_dns_enabled=True)
+        vpc.add_interface_endpoint('ECRAPIEndpoint',
+                                   service=ec2.InterfaceVpcEndpointAwsService('ecr.api'),
+                                   private_dns_enabled=True)
+        vpc.add_interface_endpoint('ECRDockerEndpoint',
+                                   service=ec2.InterfaceVpcEndpointAwsService.ECR_DOCKER,
+                                   private_dns_enabled=True)
+
         vpc.add_gateway_endpoint('S3Endpoint', service=ec2.GatewayVpcEndpointAwsService.S3)
+
         # ==================================================
         # ================= S3 BUCKET ======================
         # ==================================================
@@ -70,7 +107,8 @@ class DeploymentStack(Stack):
             scope=self,
             id='ARTIFACTBUCKET',
             bucket_name=bucket_name,
-            public_read_access=False
+            public_read_access=False,
+            encryption=s3.BucketEncryption.KMS_MANAGED
         )
         # # ==================================================
         # # ================== DATABASE  =====================
@@ -90,7 +128,7 @@ class DeploymentStack(Stack):
             instance_type=ec2.InstanceType.of(ec2.InstanceClass.BURSTABLE2, ec2.InstanceSize.SMALL),
             vpc=vpc,
             security_groups=[sg_rds],
-            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+            vpc_subnets=ec2.SubnetSelection(subnet_group_name='DB'),
             # multi_az=True,
             removal_policy=RemovalPolicy.DESTROY,
             deletion_protection=False
@@ -124,13 +162,16 @@ class DeploymentStack(Stack):
         )
         port_mapping = ecs.PortMapping(container_port=5000, host_port=5000, protocol=ecs.Protocol.TCP)
         container.add_port_mappings(port_mapping)
+        task_subnets = ec2.SubnetSelection(subnet_group_name='Private')
 
         fargate_service = ecs_patterns.NetworkLoadBalancedFargateService(
             scope=self,
             id='MLFLOW',
             service_name=service_name,
             cluster=cluster,
-            task_definition=task_definition
+            task_definition=task_definition,
+            task_subnets=task_subnets,
+            public_load_balancer=False
         )
 
         # Setup security group
