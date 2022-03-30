@@ -9,6 +9,7 @@ from aws_cdk import (
     aws_iam as iam,
     aws_secretsmanager as sm,
     aws_ecs_patterns as ecs_patterns,
+    aws_elasticloadbalancingv2 as elbv2,
     App, Stack, CfnParameter, CfnOutput, Aws, RemovalPolicy, Duration
 )
 from constructs import Construct
@@ -50,7 +51,10 @@ class DeploymentStack(Stack):
         # ==================== VPC =========================
         # ==================================================
         # public_subnet = ec2.SubnetConfiguration(name='Public', subnet_type=ec2.SubnetType.PUBLIC, cidr_mask=28)
-        private_subnet = ec2.SubnetConfiguration(name='Private', subnet_type=ec2.SubnetType.PRIVATE_ISOLATED, cidr_mask=28)
+        private_subnet = ec2.SubnetConfiguration(
+            name='Private',
+            subnet_type=ec2.SubnetType.PRIVATE_ISOLATED,
+            cidr_mask=26)
         isolated_subnet = ec2.SubnetConfiguration(name='DB', subnet_type=ec2.SubnetType.PRIVATE_ISOLATED, cidr_mask=28)
 
         vpc = ec2.Vpc(
@@ -68,7 +72,7 @@ class DeploymentStack(Stack):
         # NFS traffic
         sg_sagemaker.add_ingress_rule(peer=ec2.Peer.ipv4('10.0.0.0/24'), connection=ec2.Port.tcp(2049))
         # All TCP traffic within security group
-        sg_sagemaker.add_ingress_rule(peer=sg_sagemaker, connection=ec2.Port.tcp(-1))
+        sg_sagemaker.add_ingress_rule(peer=sg_sagemaker, connection=ec2.Port.all_tcp())
 
         vpc.add_interface_endpoint('SagemakerAPIEndpoint',
                                    service=ec2.InterfaceVpcEndpointAwsService.SAGEMAKER_API,
@@ -96,6 +100,9 @@ class DeploymentStack(Stack):
                                    private_dns_enabled=True)
         vpc.add_interface_endpoint('ECRDockerEndpoint',
                                    service=ec2.InterfaceVpcEndpointAwsService.ECR_DOCKER,
+                                   private_dns_enabled=True)
+        vpc.add_interface_endpoint('SecretsManagerEndpoint',
+                                   service=ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
                                    private_dns_enabled=True)
 
         vpc.add_gateway_endpoint('S3Endpoint', service=ec2.GatewayVpcEndpointAwsService.S3)
@@ -162,7 +169,10 @@ class DeploymentStack(Stack):
         )
         port_mapping = ecs.PortMapping(container_port=5000, host_port=5000, protocol=ecs.Protocol.TCP)
         container.add_port_mappings(port_mapping)
-        task_subnets = ec2.SubnetSelection(subnet_group_name='Private')
+
+        vpc_subnets = ec2.SubnetSelection(subnet_group_name=private_subnet.name, one_per_az=True)
+
+        lb = elbv2.NetworkLoadBalancer(scope=self, id="MLFLOWInternalLB", vpc=vpc, vpc_subnets=vpc_subnets)
 
         fargate_service = ecs_patterns.NetworkLoadBalancedFargateService(
             scope=self,
@@ -170,7 +180,8 @@ class DeploymentStack(Stack):
             service_name=service_name,
             cluster=cluster,
             task_definition=task_definition,
-            task_subnets=task_subnets,
+            load_balancer=lb,
+            task_subnets=vpc_subnets,
             public_load_balancer=False
         )
 
