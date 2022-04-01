@@ -50,10 +50,10 @@ class DeploymentStack(Stack):
         # ==================================================
         # ==================== VPC =========================
         # ==================================================
-        # public_subnet = ec2.SubnetConfiguration(name='Public', subnet_type=ec2.SubnetType.PUBLIC, cidr_mask=28)
+        public_subnet = ec2.SubnetConfiguration(name='Public', subnet_type=ec2.SubnetType.PUBLIC, cidr_mask=28)
         private_subnet = ec2.SubnetConfiguration(
             name='Private',
-            subnet_type=ec2.SubnetType.PRIVATE_ISOLATED,
+            subnet_type=ec2.SubnetType.PRIVATE_WITH_NAT,
             cidr_mask=26)
         isolated_subnet = ec2.SubnetConfiguration(name='DB', subnet_type=ec2.SubnetType.PRIVATE_ISOLATED, cidr_mask=28)
 
@@ -62,9 +62,10 @@ class DeploymentStack(Stack):
             id='VPC',
             cidr='10.0.0.0/24',
             max_azs=2,
-            nat_gateways=0,
-            subnet_configuration=[private_subnet, isolated_subnet]
+            nat_gateways=1,
+            subnet_configuration=[public_subnet, private_subnet, isolated_subnet]
         )
+
         # ==================================================
         # ==================== Sagemaker Config =========================
         # ==================================================
@@ -73,37 +74,6 @@ class DeploymentStack(Stack):
         sg_sagemaker.add_ingress_rule(peer=ec2.Peer.ipv4('10.0.0.0/24'), connection=ec2.Port.tcp(2049))
         # All TCP traffic within security group
         sg_sagemaker.add_ingress_rule(peer=sg_sagemaker, connection=ec2.Port.all_tcp())
-
-        vpc.add_interface_endpoint('SagemakerAPIEndpoint',
-                                   service=ec2.InterfaceVpcEndpointAwsService.SAGEMAKER_API,
-                                   private_dns_enabled=True)
-        vpc.add_interface_endpoint('SagemakerRuntimeEndpoint',
-                                   service=ec2.InterfaceVpcEndpointAwsService.SAGEMAKER_RUNTIME,
-                                   private_dns_enabled=True)
-        vpc.add_interface_endpoint('SagemakerNotebookEndpoint',
-                                   service=ec2.InterfaceVpcEndpointAwsService.SAGEMAKER_NOTEBOOK,
-                                   private_dns_enabled=True)
-        vpc.add_interface_endpoint('STSEndpoint',
-                                   service=ec2.InterfaceVpcEndpointAwsService.STS,
-                                   private_dns_enabled=True)
-        vpc.add_interface_endpoint('SSMEndpoint',
-                                   service=ec2.InterfaceVpcEndpointAwsService.SSM,
-                                   private_dns_enabled=True)
-        vpc.add_interface_endpoint('MonitoringEndpoint',
-                                   service=ec2.InterfaceVpcEndpointAwsService('monitoring'),
-                                   private_dns_enabled=True)
-        vpc.add_interface_endpoint('LogsEndpoint',
-                                   service=ec2.InterfaceVpcEndpointAwsService('logs'),
-                                   private_dns_enabled=True)
-        vpc.add_interface_endpoint('ECRAPIEndpoint',
-                                   service=ec2.InterfaceVpcEndpointAwsService('ecr.api'),
-                                   private_dns_enabled=True)
-        vpc.add_interface_endpoint('ECRDockerEndpoint',
-                                   service=ec2.InterfaceVpcEndpointAwsService.ECR_DOCKER,
-                                   private_dns_enabled=True)
-        vpc.add_interface_endpoint('SecretsManagerEndpoint',
-                                   service=ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
-                                   private_dns_enabled=True)
 
         vpc.add_gateway_endpoint('S3Endpoint', service=ec2.GatewayVpcEndpointAwsService.S3)
 
@@ -148,8 +118,7 @@ class DeploymentStack(Stack):
         task_definition = ecs.FargateTaskDefinition(
             scope=self,
             id='MLflow',
-            task_role=role,
-
+            task_role=role
         )
 
         container = task_definition.add_container(
@@ -192,6 +161,8 @@ class DeploymentStack(Stack):
             description='Allow inbound from VPC for mlflow'
         )
 
+        fargate_service.service.connections.security_groups.append(sg_sagemaker)
+
         # Setup autoscaling policy
         scaling = fargate_service.service.auto_scale_task_count(max_capacity=2)
         scaling.scale_on_cpu_utilization(
@@ -207,5 +178,5 @@ class DeploymentStack(Stack):
 
 
 app = App()
-DeploymentStack(app, "DeploymentStack")
+DeploymentStack(app, "MLFlowDeploymentStack")
 app.synth()
