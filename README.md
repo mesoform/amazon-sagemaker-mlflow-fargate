@@ -59,10 +59,15 @@ RDS. You can then use the load balancer URI present in the stack outputs to acce
 ![](media/load-balancer.png)
 ![](media/mlflow-interface.png)
 
-**N.B:** In this illustrative example stack, the load balancer is launched on a public subnet and is internet facing.
-For security purposes, you may want to provision an internal load balancer in your VPC private subnets where there is no
-direct connectivity from the outside world. Here is a blog post explaining how to achieve
-this: [Access Private applications on AWS Fargate using Amazon API Gateway PrivateLink](https://aws.amazon.com/blogs/compute/access-private-applications-on-aws-fargate-using-amazon-api-gateway-privatelink/)
+**N.B:** In this diagram above, the load balancer is launched on a public subnet and is internet facing.
+In the stack from this repo, the load balancer is an internal network load balancer, 
+so can only be access from within the private subnet.   
+
+### Sagemaker Domain Setup
+When configuring the SageMaker Domain, be sure to set `VPC Only` mode (*See [documentation](https://docs.aws.amazon.com/sagemaker/latest/dg/studio-notebooks-and-internet-access.html#studio-notebooks-and-internet-access-vpc)*).   
+For the subnets, set the two 'Private' subnets within the MLFlow VPC. 
+This allows sagemaker to use MLflow (see below), and have internet access using the NAT Gateways.
+
 
 ### Managing an ML lifecycle with Amazon SageMaker and MLflow
 

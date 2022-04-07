@@ -9,6 +9,7 @@ from aws_cdk import (
     aws_iam as iam,
     aws_secretsmanager as sm,
     aws_ecs_patterns as ecs_patterns,
+    aws_elasticloadbalancingv2 as elbv2,
     App, Stack, CfnParameter, CfnOutput, Aws, RemovalPolicy, Duration
 )
 from constructs import Construct
@@ -50,7 +51,10 @@ class DeploymentStack(Stack):
         # ==================== VPC =========================
         # ==================================================
         public_subnet = ec2.SubnetConfiguration(name='Public', subnet_type=ec2.SubnetType.PUBLIC, cidr_mask=28)
-        private_subnet = ec2.SubnetConfiguration(name='Private', subnet_type=ec2.SubnetType.PRIVATE_WITH_NAT, cidr_mask=28)
+        private_subnet = ec2.SubnetConfiguration(
+            name='Private',
+            subnet_type=ec2.SubnetType.PRIVATE_WITH_NAT,
+            cidr_mask=26)
         isolated_subnet = ec2.SubnetConfiguration(name='DB', subnet_type=ec2.SubnetType.PRIVATE_ISOLATED, cidr_mask=28)
 
         vpc = ec2.Vpc(
@@ -58,11 +62,21 @@ class DeploymentStack(Stack):
             id='VPC',
             cidr='10.0.0.0/24',
             max_azs=2,
-            nat_gateway_provider=ec2.NatProvider.gateway(),
             nat_gateways=1,
             subnet_configuration=[public_subnet, private_subnet, isolated_subnet]
         )
+
+        # ==================================================
+        # ==================== Sagemaker Config =========================
+        # ==================================================
+        sg_sagemaker = ec2.SecurityGroup(scope=self, id='SGSAGEMAKER', vpc=vpc, security_group_name='sg_sagemaker')
+        # NFS traffic
+        sg_sagemaker.add_ingress_rule(peer=ec2.Peer.ipv4('10.0.0.0/24'), connection=ec2.Port.tcp(2049))
+        # All TCP traffic within security group
+        sg_sagemaker.add_ingress_rule(peer=sg_sagemaker, connection=ec2.Port.all_tcp())
+
         vpc.add_gateway_endpoint('S3Endpoint', service=ec2.GatewayVpcEndpointAwsService.S3)
+
         # ==================================================
         # ================= S3 BUCKET ======================
         # ==================================================
@@ -70,7 +84,8 @@ class DeploymentStack(Stack):
             scope=self,
             id='ARTIFACTBUCKET',
             bucket_name=bucket_name,
-            public_read_access=False
+            public_read_access=False,
+            encryption=s3.BucketEncryption.KMS_MANAGED
         )
         # # ==================================================
         # # ================== DATABASE  =====================
@@ -90,7 +105,7 @@ class DeploymentStack(Stack):
             instance_type=ec2.InstanceType.of(ec2.InstanceClass.BURSTABLE2, ec2.InstanceSize.SMALL),
             vpc=vpc,
             security_groups=[sg_rds],
-            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+            vpc_subnets=ec2.SubnetSelection(subnet_group_name='DB'),
             # multi_az=True,
             removal_policy=RemovalPolicy.DESTROY,
             deletion_protection=False
@@ -103,8 +118,7 @@ class DeploymentStack(Stack):
         task_definition = ecs.FargateTaskDefinition(
             scope=self,
             id='MLflow',
-            task_role=role,
-
+            task_role=role
         )
 
         container = task_definition.add_container(
@@ -125,12 +139,19 @@ class DeploymentStack(Stack):
         port_mapping = ecs.PortMapping(container_port=5000, host_port=5000, protocol=ecs.Protocol.TCP)
         container.add_port_mappings(port_mapping)
 
+        vpc_subnets = ec2.SubnetSelection(subnet_group_name=private_subnet.name, one_per_az=True)
+
+        lb = elbv2.NetworkLoadBalancer(scope=self, id="MLFLOWInternalLB", vpc=vpc, vpc_subnets=vpc_subnets)
+
         fargate_service = ecs_patterns.NetworkLoadBalancedFargateService(
             scope=self,
             id='MLFLOW',
             service_name=service_name,
             cluster=cluster,
-            task_definition=task_definition
+            task_definition=task_definition,
+            load_balancer=lb,
+            task_subnets=vpc_subnets,
+            public_load_balancer=False
         )
 
         # Setup security group
@@ -139,6 +160,8 @@ class DeploymentStack(Stack):
             connection=ec2.Port.tcp(5000),
             description='Allow inbound from VPC for mlflow'
         )
+
+        fargate_service.service.connections.security_groups.append(sg_sagemaker)
 
         # Setup autoscaling policy
         scaling = fargate_service.service.auto_scale_task_count(max_capacity=2)
@@ -155,5 +178,5 @@ class DeploymentStack(Stack):
 
 
 app = App()
-DeploymentStack(app, "DeploymentStack")
+DeploymentStack(app, "MLFlowDeploymentStack")
 app.synth()
