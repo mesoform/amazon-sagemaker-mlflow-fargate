@@ -10,12 +10,18 @@ from aws_cdk import (
     aws_secretsmanager as sm,
     aws_ecs_patterns as ecs_patterns,
     aws_elasticloadbalancingv2 as elbv2,
+    aws_sagemaker as sagemaker,
+    aws_kms as kms,
     App, Stack, CfnParameter, CfnOutput, Aws, RemovalPolicy, Duration
+
 )
 from constructs import Construct
 
 
 class DeploymentStack(Stack):
+    export_vpc: ec2.Vpc
+    export_sg: str
+
     def __init__(self, scope: Construct, id: str, **kwargs) -> None:
         super().__init__(scope, id, **kwargs)
         # ==============================
@@ -65,6 +71,7 @@ class DeploymentStack(Stack):
             nat_gateways=1,
             subnet_configuration=[public_subnet, private_subnet, isolated_subnet]
         )
+        self.export_vpc = vpc
 
         # ==================================================
         # ==================== Sagemaker Config =========================
@@ -74,6 +81,7 @@ class DeploymentStack(Stack):
         sg_sagemaker.add_ingress_rule(peer=ec2.Peer.ipv4('10.0.0.0/24'), connection=ec2.Port.tcp(2049))
         # All TCP traffic within security group
         sg_sagemaker.add_ingress_rule(peer=sg_sagemaker, connection=ec2.Port.all_tcp())
+        self.export_sg = sg_sagemaker.security_group_id
 
         vpc.add_gateway_endpoint('S3Endpoint', service=ec2.GatewayVpcEndpointAwsService.S3)
 
@@ -177,6 +185,36 @@ class DeploymentStack(Stack):
         CfnOutput(scope=self, id='LoadBalancerDNS', value=fargate_service.load_balancer.load_balancer_dns_name)
 
 
+class SagemakerStack(Stack):
+    export_vpc: str
+    export_sg: str
+
+    def __init__(self, scope: Construct, id: str, vpc: ec2.Vpc, security_group: str, **kwargs) -> None:
+        super().__init__(scope, id, **kwargs)
+        auth_mode = "SSO"
+        domain_name = f'{Aws.ACCOUNT_ID}-sg-domain'
+        subnet_ids = [subnet.subnet_id for subnet in vpc.private_subnets]
+        # subnet_ids = ec2.Vpc.fromLookup(scope=self, id="VPC", vpc_id=vpc_id).private_subnets
+        security_groups = [security_group]
+        user_settings_property = sagemaker.CfnDomain.UserSettingsProperty(
+            security_groups=security_groups
+        )
+        app_network_access_type = "VpcOnly"
+        encryption_key = kms.Key(scope=self, id="SagemakerKey", enable_key_rotation=True)
+        vpc_id = vpc.vpc_id
+        cfn_domain = sagemaker.CfnDomain(scope=self, id="SagemakerDomain",
+                                         auth_mode=auth_mode,
+                                         default_user_settings=user_settings_property,
+                                         domain_name=domain_name,
+                                         subnet_ids=subnet_ids,
+                                         vpc_id=vpc_id,
+                                         app_network_access_type=app_network_access_type,
+                                         kms_key_id=encryption_key.key_id
+                                         )
+        CfnOutput(scope=self, id='Sagemaker Domain Name', value=cfn_domain.domain_name)
+
+
 app = App()
-DeploymentStack(app, "MLFlowDeploymentStack")
+mlflow = DeploymentStack(app, "MLFlowDeploymentStack")
+SagemakerStack(app, "SagemakerStudioStack", vpc=mlflow.export_vpc, security_group=mlflow.export_sg)
 app.synth()
