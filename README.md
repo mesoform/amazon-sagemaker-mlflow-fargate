@@ -22,6 +22,12 @@ implementation uses an Amazon S3 bucket as artifact store and an Amazon RDS inst
 
 ![](media/architecture-mlflow.png)
 
+### Sagemaker Domain 
+A SageMakerDeployment stack is also deployed. 
+It uses `VPC Only` mode (*See [documentation](https://docs.aws.amazon.com/sagemaker/latest/dg/studio-notebooks-and-internet-access.html#studio-notebooks-and-internet-access-vpc)*).   
+and the subnets and security group configured in the MLFlow Stack.  
+It is configured to use SSO as the authentication mode, and use an existing Sagmaker Execution Role, or create a new one if that isn't present.
+
 ### Prerequisites
 We will use [the AWS CDK](https://cdkworkshop.com/) to deploy the MLflow server.
 
@@ -48,7 +54,7 @@ Once this is installed, you can execute the following commands to deploy the inf
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account | tr -d '"')
 AWS_REGION=$(aws configure get region)
 cdk bootstrap aws://${ACCOUNT_ID}/${AWS_REGION}
-cdk deploy --parameters ProjectName=mlflow --require-approval never
+cdk deploy --parameters Environment=account-name --require-approval never --all
 ```
 
 The first 2 commands will get your account ID and current AWS region using the AWS CLI on your computer. ```cdk
@@ -63,10 +69,7 @@ RDS. You can then use the load balancer URI present in the stack outputs to acce
 In the stack from this repo, the load balancer is an internal network load balancer, 
 so can only be access from within the private subnet.   
 
-### Sagemaker Domain Setup
-When configuring the SageMaker Domain, be sure to set `VPC Only` mode (*See [documentation](https://docs.aws.amazon.com/sagemaker/latest/dg/studio-notebooks-and-internet-access.html#studio-notebooks-and-internet-access-vpc)*).   
-For the subnets, set the two 'Private' subnets within the MLFlow VPC. 
-This allows sagemaker to use MLflow (see below), and have internet access using the NAT Gateways.
+
 
 
 ### Managing an ML lifecycle with Amazon SageMaker and MLflow

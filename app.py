@@ -16,6 +16,7 @@ from aws_cdk import (
 
 )
 from constructs import Construct
+import boto3
 
 
 class DeploymentStack(Stack):
@@ -27,11 +28,11 @@ class DeploymentStack(Stack):
         # ==============================
         # ======= CFN PARAMETERS =======
         # ==============================
-        project_name_param = CfnParameter(scope=self, id='ProjectName', type='String')
+        environment = CfnParameter(scope=self, id='Environment', type='String')
         db_name = 'mlflowdb'
         port = 3306
         username = 'master'
-        bucket_name = f'{project_name_param.value_as_string}-artifacts-{Aws.ACCOUNT_ID}'
+        bucket_name = f'mlflow-artifacts-{Aws.ACCOUNT_ID}'
         container_repo_name = 'mlflow-containers'
         cluster_name = 'mlflow'
         service_name = 'mlflow'
@@ -186,19 +187,37 @@ class DeploymentStack(Stack):
 
 
 class SagemakerStack(Stack):
-    export_vpc: str
-    export_sg: str
-
     def __init__(self, scope: Construct, id: str, vpc: ec2.Vpc, security_group: str, **kwargs) -> None:
         super().__init__(scope, id, **kwargs)
-        project_name_param = CfnParameter(scope=self, id='ProjectName', type='String')
+        environment = CfnParameter(scope=self, id='Environment', type='String')
         auth_mode = "SSO"
-        domain_name = f'{Aws.ACCOUNT_ID}-sg-domain'
         subnet_ids = [subnet.subnet_id for subnet in vpc.private_subnets]
         # subnet_ids = ec2.Vpc.fromLookup(scope=self, id="VPC", vpc_id=vpc_id).private_subnets
         security_groups = [security_group]
+        aws_client = boto3.client('iam')
+        roles = aws_client.list_roles()['Roles']
+        sagemaker_roles = [role for role in roles if 'SageMaker' in role['RoleName']]
+        execution_roles = [role for role in sagemaker_roles if 'ExecutionRole' in role['RoleName']]
+        if len(execution_roles) > 0:
+            execution_role = iam.Role.from_role_arn(self, id='SM_EXECUTION_ROLE', role_arn=execution_roles[0]['Arn'])
+        else:
+            execution_policy_document = iam.PolicyDocument(
+                statements=[
+                    iam.PolicyStatement(
+                        actions=["s3:ListBucket"],
+                        resources=["arn:aws:s3:::SageMaker"]
+                    ),
+                    iam.PolicyStatement(
+                        actions=["s3.GetObject", "s3:PutObject", "s3:DeleteObject"],
+                        resources=["arn:aws:s3:::SageMaker/*"]
+                    )
+                ]
+            )
+            managed_policy = iam.ManagedPolicy.from_managed_policy_arn("arn:aws:iam::aws:policy/AmazonSageMakerFullAccess")
+            execution_role = iam.Role(inline_policies=execution_policy_document, managed_policies=managed_policy)
         user_settings_property = sagemaker.CfnDomain.UserSettingsProperty(
-            security_groups=security_groups
+            security_groups=security_groups,
+            execution_role=execution_role.role_arn
         )
         app_network_access_type = "VpcOnly"
         encryption_key = kms.Key(scope=self, id="SagemakerKey", enable_key_rotation=True)
@@ -206,13 +225,14 @@ class SagemakerStack(Stack):
         cfn_domain = sagemaker.CfnDomain(scope=self, id="SagemakerDomain",
                                          auth_mode=auth_mode,
                                          default_user_settings=user_settings_property,
-                                         domain_name=domain_name,
+                                         domain_name=environment.value_as_string,
                                          subnet_ids=subnet_ids,
                                          vpc_id=vpc_id,
                                          app_network_access_type=app_network_access_type,
                                          kms_key_id=encryption_key.key_id
                                          )
         CfnOutput(scope=self, id='Sagemaker Domain Name', value=cfn_domain.domain_name)
+        CfnOutput(scope=self, id='Sagemaker Domain ID', value=cfn_domain.attr_domain_id)
 
 
 app = App()
