@@ -13,7 +13,6 @@ from aws_cdk import (
     aws_sagemaker as sagemaker,
     aws_kms as kms,
     App, Stack, CfnParameter, CfnOutput, Aws, RemovalPolicy, Duration
-
 )
 from constructs import Construct
 import boto3
@@ -29,6 +28,8 @@ class DeploymentStack(Stack):
         # ======= CFN PARAMETERS =======
         # ==============================
         environment = CfnParameter(scope=self, id='Environment', type='String')
+        access_ips_param = CfnParameter(scope=self, id='AccessIPs', type='String')
+        access_ips = access_ips_param.value_as_string.split(',')
         db_name = 'mlflowdb'
         port = 3306
         username = 'master'
@@ -58,10 +59,7 @@ class DeploymentStack(Stack):
         # ==================== VPC =========================
         # ==================================================
         public_subnet = ec2.SubnetConfiguration(name='Public', subnet_type=ec2.SubnetType.PUBLIC, cidr_mask=28)
-        private_subnet = ec2.SubnetConfiguration(
-            name='Private',
-            subnet_type=ec2.SubnetType.PRIVATE_WITH_NAT,
-            cidr_mask=26)
+        private_subnet = ec2.SubnetConfiguration(name='Private', subnet_type=ec2.SubnetType.PRIVATE_WITH_NAT, cidr_mask=28)
         isolated_subnet = ec2.SubnetConfiguration(name='DB', subnet_type=ec2.SubnetType.PRIVATE_ISOLATED, cidr_mask=28)
 
         vpc = ec2.Vpc(
@@ -69,6 +67,7 @@ class DeploymentStack(Stack):
             id='VPC',
             cidr='10.0.0.0/24',
             max_azs=2,
+            nat_gateway_provider=ec2.NatProvider.gateway(),
             nat_gateways=1,
             subnet_configuration=[public_subnet, private_subnet, isolated_subnet]
         )
@@ -85,7 +84,6 @@ class DeploymentStack(Stack):
         self.export_sg = sg_sagemaker.security_group_id
 
         vpc.add_gateway_endpoint('S3Endpoint', service=ec2.GatewayVpcEndpointAwsService.S3)
-
         # ==================================================
         # ================= S3 BUCKET ======================
         # ==================================================
@@ -114,7 +112,7 @@ class DeploymentStack(Stack):
             instance_type=ec2.InstanceType.of(ec2.InstanceClass.BURSTABLE2, ec2.InstanceSize.SMALL),
             vpc=vpc,
             security_groups=[sg_rds],
-            vpc_subnets=ec2.SubnetSelection(subnet_group_name='DB'),
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
             # multi_az=True,
             removal_policy=RemovalPolicy.DESTROY,
             deletion_protection=False
@@ -151,7 +149,10 @@ class DeploymentStack(Stack):
         vpc_subnets = ec2.SubnetSelection(subnet_group_name=private_subnet.name, one_per_az=True)
 
         lb = elbv2.NetworkLoadBalancer(scope=self, id="MLFLOWInternalLB", vpc=vpc, vpc_subnets=vpc_subnets)
-
+        sg_ui= ec2.SecurityGroup(scope=self, id='SGMLFLOWUI', vpc=vpc, security_group_name='sg_mlfow_ui')
+        # Adds an ingress rule which allows resources in the VPC's CIDR to access the database.
+        for ip in access_ips:
+            sg_ui.add_ingress_rule(peer=ec2.Peer.ipv4('{}/32'.format(ip)), connection=ec2.Port.tcp(443))
         fargate_service = ecs_patterns.NetworkLoadBalancedFargateService(
             scope=self,
             id='MLFLOW',
@@ -163,6 +164,14 @@ class DeploymentStack(Stack):
             public_load_balancer=False
         )
 
+        # fargate_service = ecs_patterns.ApplicationLoadBalancedFargateService(
+        #     scope=self,
+        #     id='MLFLOW',
+        #     service_name=service_name,
+        #     security_groups=[sg_ui, sg_sagemaker],
+        #     protocol=elbv2.ApplicationProtocol('HTTPS')
+        # )
+
         # Setup security group
         fargate_service.service.connections.security_groups[0].add_ingress_rule(
             peer=ec2.Peer.ipv4(vpc.vpc_cidr_block),
@@ -170,7 +179,7 @@ class DeploymentStack(Stack):
             description='Allow inbound from VPC for mlflow'
         )
 
-        fargate_service.service.connections.security_groups.append(sg_sagemaker)
+        fargate_service.service.connections.security_groups.extend([sg_sagemaker,sg_ui])
 
         # Setup autoscaling policy
         scaling = fargate_service.service.auto_scale_task_count(max_capacity=2)
