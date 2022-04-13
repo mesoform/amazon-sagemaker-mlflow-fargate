@@ -191,6 +191,7 @@ class SagemakerStack(Stack):
 
     def __init__(self, scope: Construct, id: str, vpc: ec2.Vpc, security_group: str, **kwargs) -> None:
         super().__init__(scope, id, **kwargs)
+        project_name_param = CfnParameter(scope=self, id='ProjectName', type='String')
         auth_mode = "SSO"
         domain_name = f'{Aws.ACCOUNT_ID}-sg-domain'
         subnet_ids = [subnet.subnet_id for subnet in vpc.private_subnets]
