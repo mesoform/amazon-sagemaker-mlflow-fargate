@@ -81,6 +81,7 @@ class DeploymentStack(Stack):
         sg_sagemaker.add_ingress_rule(peer=ec2.Peer.ipv4('10.0.0.0/24'), connection=ec2.Port.tcp(2049))
         # All TCP traffic within security group
         sg_sagemaker.add_ingress_rule(peer=sg_sagemaker, connection=ec2.Port.all_tcp())
+        sg_sagemaker.add_ingress_rule(peer=ec2.Peer.ipv4('10.0.0.0/24'), connection=ec2.Port.tcp(80))
         self.export_sg = sg_sagemaker.security_group_id
 
         vpc.add_gateway_endpoint('S3Endpoint', service=ec2.GatewayVpcEndpointAwsService.S3)
@@ -148,29 +149,39 @@ class DeploymentStack(Stack):
 
         vpc_subnets = ec2.SubnetSelection(subnet_group_name=private_subnet.name, one_per_az=True)
 
-        lb = elbv2.NetworkLoadBalancer(scope=self, id="MLFLOWInternalLB", vpc=vpc, vpc_subnets=vpc_subnets)
+        # lb = elbv2.NetworkLoadBalancer(scope=self, id="MLFLOWInternalLB", vpc=vpc, vpc_subnets=vpc_subnets)
         sg_ui= ec2.SecurityGroup(scope=self, id='SGMLFLOWUI', vpc=vpc, security_group_name='sg_mlfow_ui')
         # Adds an ingress rule which allows resources in the VPC's CIDR to access the database.
         for ip in access_ips:
-            sg_ui.add_ingress_rule(peer=ec2.Peer.ipv4('{}/32'.format(ip)), connection=ec2.Port.tcp(443))
-        fargate_service = ecs_patterns.NetworkLoadBalancedFargateService(
+            sg_ui.add_ingress_rule(peer=ec2.Peer.ipv4('{}/32'.format(ip)), connection=ec2.Port.tcp(80))
+        # fargate_service = ecs_patterns.NetworkLoadBalancedFargateService(
+        #     scope=self,
+        #     id='MLFLOW',
+        #     service_name=service_name,
+        #     cluster=cluster,
+        #     task_definition=task_definition,
+        #     load_balancer=lb,
+        #     task_subnets=vpc_subnets,
+        #     public_load_balancer=False
+        # )
+
+        lb = elbv2.ApplicationLoadBalancer(
+            scope=self,
+            id="MLFLOWAppLB",
+            vpc=vpc,
+            internet_facing=True,
+            security_group=sg_ui
+        )
+        fargate_service = ecs_patterns.ApplicationLoadBalancedFargateService(
             scope=self,
             id='MLFLOW',
             service_name=service_name,
             cluster=cluster,
+            security_groups=[sg_ui, sg_sagemaker],
             task_definition=task_definition,
             load_balancer=lb,
-            task_subnets=vpc_subnets,
-            public_load_balancer=False
+            open_listener=False
         )
-
-        # fargate_service = ecs_patterns.ApplicationLoadBalancedFargateService(
-        #     scope=self,
-        #     id='MLFLOW',
-        #     service_name=service_name,
-        #     security_groups=[sg_ui, sg_sagemaker],
-        #     protocol=elbv2.ApplicationProtocol('HTTPS')
-        # )
 
         # Setup security group
         fargate_service.service.connections.security_groups[0].add_ingress_rule(
@@ -179,7 +190,9 @@ class DeploymentStack(Stack):
             description='Allow inbound from VPC for mlflow'
         )
 
-        fargate_service.service.connections.security_groups.extend([sg_sagemaker,sg_ui])
+        fargate_service.service.connections.security_groups.extend([sg_sagemaker, sg_ui])
+
+        # fargate_service.load_balancer.listeners[0].add_action()
 
         # Setup autoscaling policy
         scaling = fargate_service.service.auto_scale_task_count(max_capacity=2)
@@ -199,9 +212,9 @@ class SagemakerStack(Stack):
     def __init__(self, scope: Construct, id: str, vpc: ec2.Vpc, security_group: str, **kwargs) -> None:
         super().__init__(scope, id, **kwargs)
         environment = CfnParameter(scope=self, id='Environment', type='String')
+        access_ips_param = CfnParameter(scope=self, id='AccessIPs', type='String')
         auth_mode = "SSO"
-        subnet_ids = [subnet.subnet_id for subnet in vpc.private_subnets]
-        # subnet_ids = ec2.Vpc.fromLookup(scope=self, id="VPC", vpc_id=vpc_id).private_subnets
+        subnet_ids = [subnet.subnet_id for subnet in vpc.public_subnets]
         security_groups = [security_group]
         aws_client = boto3.client('iam')
         roles = aws_client.list_roles()['Roles']
@@ -229,7 +242,7 @@ class SagemakerStack(Stack):
             execution_role=execution_role.role_arn
         )
         app_network_access_type = "VpcOnly"
-        encryption_key = kms.Key(scope=self, id="SagemakerKey", enable_key_rotation=True)
+        # encryption_key = kms.Key(scope=self, id="SagemakerKey", enable_key_rotation=True)
         vpc_id = vpc.vpc_id
         cfn_domain = sagemaker.CfnDomain(scope=self, id="SagemakerDomain",
                                          auth_mode=auth_mode,
@@ -237,8 +250,7 @@ class SagemakerStack(Stack):
                                          domain_name=environment.value_as_string,
                                          subnet_ids=subnet_ids,
                                          vpc_id=vpc_id,
-                                         app_network_access_type=app_network_access_type,
-                                         kms_key_id=encryption_key.key_id
+                                         app_network_access_type=app_network_access_type
                                          )
         CfnOutput(scope=self, id='Sagemaker Domain Name', value=cfn_domain.domain_name)
         CfnOutput(scope=self, id='Sagemaker Domain ID', value=cfn_domain.attr_domain_id)
