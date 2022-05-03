@@ -150,9 +150,6 @@ class DeploymentStack(Stack):
         port_mapping = ecs.PortMapping(container_port=5000, host_port=5000, protocol=ecs.Protocol.TCP)
         container.add_port_mappings(port_mapping)
 
-        vpc_subnets = ec2.SubnetSelection(subnet_group_name=private_subnet.name, one_per_az=True)
-
-        # lb = elbv2.NetworkLoadBalancer(scope=self, id="MLFLOWInternalLB", vpc=vpc, vpc_subnets=vpc_subnets)
         sg_ui = ec2.SecurityGroup(scope=self, id='SGMLFLOWUI', vpc=vpc, security_group_name='sg_mlfow_ui')
         # Adds an ingress rule which allows resources in the VPC's CIDR to access the database.
         if access_ip.value_as_string != '':
@@ -186,8 +183,6 @@ class DeploymentStack(Stack):
 
         fargate_service.service.connections.security_groups.extend([sg_sagemaker, sg_ui])
 
-        # fargate_service.load_balancer.listeners[0].add_action()
-
         # Setup autoscaling policy
         scaling = fargate_service.service.auto_scale_task_count(max_capacity=2)
         scaling.scale_on_cpu_utilization(
@@ -210,10 +205,6 @@ class SagemakerStack(Stack):
         access_ip_param = CfnParameter(scope=self, id='AccessIP', type='String', default = '')
         auth_mode = "SSO"
         subnet_ids = [subnet.subnet_id for subnet in vpc.private_subnets]
-        # ec2_client = boto3.client('ec2')
-        # eip_addresses = ec2_client.describe_addresses()['Addresses']
-        # nat_eip = [eip_dict['PublicIp'] for eip_dict in eip_addresses if eip_dict['AssociationId'] == nat_allocation_id]
-        # security_group.add_ingress_rule(peer=ec2.Peer.ipv4('{}/32'.format(nat_eip[0])), connection=ec2.Port.tcp(80))
         security_groups = [security_group.security_group_id]
         iam_client = boto3.client('iam')
         roles = iam_client.list_roles()['Roles']
@@ -241,7 +232,6 @@ class SagemakerStack(Stack):
             execution_role=execution_role.role_arn
         )
         app_network_access_type = "VpcOnly"
-        # encryption_key = kms.Key(scope=self, id="SagemakerKey", enable_key_rotation=True)
         vpc_id = vpc.vpc_id
         cfn_domain = sagemaker.CfnDomain(scope=self, id="SagemakerDomain",
                                          auth_mode=auth_mode,
