@@ -11,7 +11,6 @@ from aws_cdk import (
     aws_ecs_patterns as ecs_patterns,
     aws_elasticloadbalancingv2 as elbv2,
     aws_sagemaker as sagemaker,
-    aws_kms as kms,
     App, Stack, CfnParameter, CfnOutput, Aws, RemovalPolicy, Duration
 )
 from constructs import Construct
@@ -20,16 +19,15 @@ import boto3
 
 class DeploymentStack(Stack):
     export_vpc: ec2.Vpc
-    export_sg: str
+    export_sg: ec2.SecurityGroup
 
     def __init__(self, scope: Construct, id: str, **kwargs) -> None:
         super().__init__(scope, id, **kwargs)
         # ==============================
         # ======= CFN PARAMETERS =======
         # ==============================
-        environment = CfnParameter(scope=self, id='Environment', type='String')
-        access_ips_param = CfnParameter(scope=self, id='AccessIPs', type='String')
-        access_ips = access_ips_param.value_as_string.split(',')
+        environment = CfnParameter(scope=self, id='Environment', type='String', default='mlflow')
+        access_ip = CfnParameter(scope=self, id='AccessIP', type='String', default='')
         db_name = 'mlflowdb'
         port = 3306
         username = 'master'
@@ -62,12 +60,17 @@ class DeploymentStack(Stack):
         private_subnet = ec2.SubnetConfiguration(name='Private', subnet_type=ec2.SubnetType.PRIVATE_WITH_NAT, cidr_mask=28)
         isolated_subnet = ec2.SubnetConfiguration(name='DB', subnet_type=ec2.SubnetType.PRIVATE_ISOLATED, cidr_mask=28)
 
+        nat_eip = ec2.CfnEIP(self, "VPCNATPublicIP", domain="vpc")
+        nat_eip_allocation_id = nat_eip.attr_allocation_id
+        self.export_eip_allocation_id = nat_eip_allocation_id
+        nat_gateway = ec2.NatProvider.gateway(eip_allocation_ids=[nat_eip_allocation_id])
+
         vpc = ec2.Vpc(
             scope=self,
             id='VPC',
             cidr='10.0.0.0/24',
             max_azs=2,
-            nat_gateway_provider=ec2.NatProvider.gateway(),
+            nat_gateway_provider=nat_gateway,
             nat_gateways=1,
             subnet_configuration=[public_subnet, private_subnet, isolated_subnet]
         )
@@ -82,7 +85,7 @@ class DeploymentStack(Stack):
         # All TCP traffic within security group
         sg_sagemaker.add_ingress_rule(peer=sg_sagemaker, connection=ec2.Port.all_tcp())
         sg_sagemaker.add_ingress_rule(peer=ec2.Peer.ipv4('10.0.0.0/24'), connection=ec2.Port.tcp(80))
-        self.export_sg = sg_sagemaker.security_group_id
+        self.export_sg = sg_sagemaker
 
         vpc.add_gateway_endpoint('S3Endpoint', service=ec2.GatewayVpcEndpointAwsService.S3)
         # ==================================================
@@ -150,20 +153,11 @@ class DeploymentStack(Stack):
         vpc_subnets = ec2.SubnetSelection(subnet_group_name=private_subnet.name, one_per_az=True)
 
         # lb = elbv2.NetworkLoadBalancer(scope=self, id="MLFLOWInternalLB", vpc=vpc, vpc_subnets=vpc_subnets)
-        sg_ui= ec2.SecurityGroup(scope=self, id='SGMLFLOWUI', vpc=vpc, security_group_name='sg_mlfow_ui')
+        sg_ui = ec2.SecurityGroup(scope=self, id='SGMLFLOWUI', vpc=vpc, security_group_name='sg_mlfow_ui')
         # Adds an ingress rule which allows resources in the VPC's CIDR to access the database.
-        for ip in access_ips:
-            sg_ui.add_ingress_rule(peer=ec2.Peer.ipv4('{}/32'.format(ip)), connection=ec2.Port.tcp(80))
-        # fargate_service = ecs_patterns.NetworkLoadBalancedFargateService(
-        #     scope=self,
-        #     id='MLFLOW',
-        #     service_name=service_name,
-        #     cluster=cluster,
-        #     task_definition=task_definition,
-        #     load_balancer=lb,
-        #     task_subnets=vpc_subnets,
-        #     public_load_balancer=False
-        # )
+        if access_ip.value_as_string != '':
+            sg_ui.add_ingress_rule(peer=ec2.Peer.ipv4('{}/32'.format(access_ip.value_as_string)), connection=ec2.Port.tcp(80))
+        sg_ui.add_ingress_rule(peer=ec2.Peer.ipv4('{}/32'.format(nat_eip.ref)), connection=ec2.Port.tcp(80))
 
         lb = elbv2.ApplicationLoadBalancer(
             scope=self,
@@ -206,18 +200,23 @@ class DeploymentStack(Stack):
         # =================== OUTPUTS ======================
         # ==================================================
         CfnOutput(scope=self, id='LoadBalancerDNS', value=fargate_service.load_balancer.load_balancer_dns_name)
+        CfnOutput(scope=self, id='NATGatewayEIP', value=nat_eip.ref)
 
 
 class SagemakerStack(Stack):
-    def __init__(self, scope: Construct, id: str, vpc: ec2.Vpc, security_group: str, **kwargs) -> None:
+    def __init__(self, scope: Construct, id: str, vpc: ec2.Vpc, security_group: ec2.SecurityGroup, **kwargs) -> None:
         super().__init__(scope, id, **kwargs)
-        environment = CfnParameter(scope=self, id='Environment', type='String')
-        access_ips_param = CfnParameter(scope=self, id='AccessIPs', type='String')
+        environment = CfnParameter(scope=self, id='Environment', type='String', default='mlflow')
+        access_ip_param = CfnParameter(scope=self, id='AccessIP', type='String', default = '')
         auth_mode = "SSO"
-        subnet_ids = [subnet.subnet_id for subnet in vpc.public_subnets]
-        security_groups = [security_group]
-        aws_client = boto3.client('iam')
-        roles = aws_client.list_roles()['Roles']
+        subnet_ids = [subnet.subnet_id for subnet in vpc.private_subnets]
+        # ec2_client = boto3.client('ec2')
+        # eip_addresses = ec2_client.describe_addresses()['Addresses']
+        # nat_eip = [eip_dict['PublicIp'] for eip_dict in eip_addresses if eip_dict['AssociationId'] == nat_allocation_id]
+        # security_group.add_ingress_rule(peer=ec2.Peer.ipv4('{}/32'.format(nat_eip[0])), connection=ec2.Port.tcp(80))
+        security_groups = [security_group.security_group_id]
+        iam_client = boto3.client('iam')
+        roles = iam_client.list_roles()['Roles']
         sagemaker_roles = [role for role in roles if 'SageMaker' in role['RoleName']]
         execution_roles = [role for role in sagemaker_roles if 'ExecutionRole' in role['RoleName']]
         if len(execution_roles) > 0:

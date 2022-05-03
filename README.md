@@ -54,7 +54,7 @@ Once this is installed, you can execute the following commands to deploy the inf
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account | tr -d '"')
 AWS_REGION=$(aws configure get region)
 cdk bootstrap aws://${ACCOUNT_ID}/${AWS_REGION}
-cdk deploy --parameters Environment=account-name --require-approval never --all
+cdk deploy --parameters Environment=account-name --parameters AccessIp=198.51.100.1 --require-approval never --all
 ```
 
 The first 2 commands will get your account ID and current AWS region using the AWS CLI on your computer. ```cdk
@@ -66,8 +66,8 @@ RDS. You can then use the load balancer URI present in the stack outputs to acce
 ![](media/mlflow-interface.png)
 
 **N.B:** In this diagram above, the load balancer is launched on a public subnet and is internet facing.
-In the stack from this repo, the load balancer is an internal network load balancer, 
-so can only be access from within the private subnet.   
+In the stack from this repo, security groups are configured to only allow access to mlflow from within the vpc, 
+and from an IP specified with the `AccessIp` parameter.   
 
 
 
