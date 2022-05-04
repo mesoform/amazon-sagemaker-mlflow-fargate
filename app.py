@@ -14,6 +14,8 @@ from aws_cdk import (
     App, Stack, CfnParameter, CfnOutput, Aws, RemovalPolicy, Duration
 )
 from constructs import Construct
+from datetime import datetime
+import os
 import boto3
 
 
@@ -27,11 +29,12 @@ class DeploymentStack(Stack):
         # ======= CFN PARAMETERS =======
         # ==============================
         environment = CfnParameter(scope=self, id='Environment', type='String', default='mlflow')
-        access_ip = CfnParameter(scope=self, id='AccessIP', type='String', default='')
+        access_ips = os.getenv('MLFLOW_ACCESS_IPS').split(',') if 'MLFLOW_ACCESS_IPS' in os.environ else []
         db_name = 'mlflowdb'
         port = 3306
         username = 'master'
-        bucket_name = f'mlflow-artifacts-{Aws.ACCOUNT_ID}'
+        account_id = boto3.client('sts').get_caller_identity()['Account']
+        bucket_name = f'mlflow-artifacts-{account_id}'
         container_repo_name = 'mlflow-containers'
         cluster_name = 'mlflow'
         service_name = 'mlflow'
@@ -74,6 +77,7 @@ class DeploymentStack(Stack):
             nat_gateways=1,
             subnet_configuration=[public_subnet, private_subnet, isolated_subnet]
         )
+
         self.export_vpc = vpc
 
         # ==================================================
@@ -91,13 +95,19 @@ class DeploymentStack(Stack):
         # ==================================================
         # ================= S3 BUCKET ======================
         # ==================================================
-        artifact_bucket = s3.Bucket(
-            scope=self,
-            id='ARTIFACTBUCKET',
-            bucket_name=bucket_name,
-            public_read_access=False,
-            encryption=s3.BucketEncryption.KMS_MANAGED
-        )
+        s3_client = boto3.client('s3')
+        buckets = s3_client.list_buckets()['Buckets']
+        if len([bucket for bucket in buckets if bucket['Name'] == bucket_name]) > 0:
+            artifact_bucket = s3.Bucket.from_bucket_name(scope=self, id='ARTIFACTBUCKET',
+                                                         bucket_name=bucket_name)
+        else:
+            artifact_bucket = s3.Bucket(
+                    scope=self,
+                    id='ARTIFACTBUCKET',
+                    bucket_name=bucket_name,
+                    public_read_access=False,
+                    encryption=s3.BucketEncryption.KMS_MANAGED
+                )
         # # ==================================================
         # # ================== DATABASE  =====================
         # # ==================================================
@@ -151,10 +161,10 @@ class DeploymentStack(Stack):
         container.add_port_mappings(port_mapping)
 
         sg_ui = ec2.SecurityGroup(scope=self, id='SGMLFLOWUI', vpc=vpc, security_group_name='sg_mlfow_ui')
-        # Adds an ingress rule which allows resources in the VPC's CIDR to access the database.
-        if access_ip.value_as_string != '':
-            sg_ui.add_ingress_rule(peer=ec2.Peer.ipv4('{}/32'.format(access_ip.value_as_string)), connection=ec2.Port.tcp(80))
-        sg_ui.add_ingress_rule(peer=ec2.Peer.ipv4('{}/32'.format(nat_eip.ref)), connection=ec2.Port.tcp(80))
+
+        for ip in access_ips:
+            sg_ui.add_ingress_rule(peer=ec2.Peer.ipv4(f'{ip}/32'), connection=ec2.Port.tcp(80))
+        sg_ui.add_ingress_rule(peer=ec2.Peer.ipv4(f'{nat_eip.ref}/32'), connection=ec2.Port.tcp(80))
 
         lb = elbv2.ApplicationLoadBalancer(
             scope=self,
@@ -202,7 +212,6 @@ class SagemakerStack(Stack):
     def __init__(self, scope: Construct, id: str, vpc: ec2.Vpc, security_group: ec2.SecurityGroup, **kwargs) -> None:
         super().__init__(scope, id, **kwargs)
         environment = CfnParameter(scope=self, id='Environment', type='String', default='mlflow')
-        access_ip_param = CfnParameter(scope=self, id='AccessIP', type='String', default = '')
         auth_mode = "SSO"
         subnet_ids = [subnet.subnet_id for subnet in vpc.private_subnets]
         security_groups = [security_group.security_group_id]
@@ -226,7 +235,9 @@ class SagemakerStack(Stack):
                 ]
             )
             managed_policy = iam.ManagedPolicy.from_managed_policy_arn("arn:aws:iam::aws:policy/AmazonSageMakerFullAccess")
-            execution_role = iam.Role(inline_policies=execution_policy_document, managed_policies=managed_policy)
+            execution_role = iam.Role(self, id='SM_EXECUTION_ROLE', inline_policies=execution_policy_document,
+                                      managed_policies=managed_policy,
+                                      role_name=f'AmazonSageMaker-ExecutionRole-{datetime.now().strftime("%y%m%d%H%M%S")}')
         user_settings_property = sagemaker.CfnDomain.UserSettingsProperty(
             security_groups=security_groups,
             execution_role=execution_role.role_arn
@@ -239,7 +250,9 @@ class SagemakerStack(Stack):
                                          domain_name=environment.value_as_string,
                                          subnet_ids=subnet_ids,
                                          vpc_id=vpc_id,
-                                         app_network_access_type=app_network_access_type
+                                         app_network_access_type=app_network_access_type,
+                                         domain_settings=sagemaker.CfnDomain.DomainSettingsProperty(
+                                             security_group_ids=security_groups)
                                          )
         CfnOutput(scope=self, id='Sagemaker Domain Name', value=cfn_domain.domain_name)
         CfnOutput(scope=self, id='Sagemaker Domain ID', value=cfn_domain.attr_domain_id)

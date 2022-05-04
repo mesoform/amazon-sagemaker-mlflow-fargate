@@ -42,7 +42,7 @@ You can view the CDK stack details in [app.py](https://github.com/aws-samples/am
 Execute the following commands to install CDK and make sure you have the right dependencies:
 
 ```
-npm install -g aws-cdk@2.8.0
+npm install -g aws-cdk@2.22.0
 python3 -m venv .venv
 source .venv/bin/activate
 pip3 install -r requirements.txt
@@ -53,8 +53,9 @@ Once this is installed, you can execute the following commands to deploy the inf
 ```
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account | tr -d '"')
 AWS_REGION=$(aws configure get region)
+export MLFLOW_ACCESS_IPS=198.51.100.1,198.51.100.2
 cdk bootstrap aws://${ACCOUNT_ID}/${AWS_REGION}
-cdk deploy --parameters Environment=account-name --parameters AccessIp=198.51.100.1 --require-approval never --all
+cdk deploy --parameters Environment=account-name --require-approval never --all
 ```
 
 The first 2 commands will get your account ID and current AWS region using the AWS CLI on your computer. ```cdk
@@ -67,7 +68,7 @@ RDS. You can then use the load balancer URI present in the stack outputs to acce
 
 **N.B:** In this diagram above, the load balancer is launched on a public subnet and is internet facing.
 In the stack from this repo, security groups are configured to only allow access to mlflow from within the vpc, 
-and from an IP specified with the `AccessIp` parameter.   
+and from IPs specified in the environment variable `MLFLOW_ACCESS_IPS`, which takes the format of a comma separated list.   
 
 
 
