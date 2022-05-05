@@ -23,8 +23,8 @@ class DeploymentStack(Stack):
     export_vpc: ec2.Vpc
     export_sg: ec2.SecurityGroup
 
-    def __init__(self, scope: Construct, id: str, **kwargs) -> None:
-        super().__init__(scope, id, **kwargs)
+    def __init__(self, scope: Construct, stack_id: str, **kwargs) -> None:
+        super().__init__(scope, stack_id, **kwargs)
         # ==============================
         # ======= CFN PARAMETERS =======
         # ==============================
@@ -209,8 +209,8 @@ class DeploymentStack(Stack):
 
 
 class SagemakerStack(Stack):
-    def __init__(self, scope: Construct, id: str, vpc: ec2.Vpc, security_group: ec2.SecurityGroup, **kwargs) -> None:
-        super().__init__(scope, id, **kwargs)
+    def __init__(self, scope: Construct, stack_id: str, vpc: ec2.Vpc, security_group: ec2.SecurityGroup, **kwargs) -> None:
+        super().__init__(scope, stack_id, **kwargs)
         environment = CfnParameter(scope=self, id='Environment', type='String', default='mlflow')
         auth_mode = "SSO"
         subnet_ids = [subnet.subnet_id for subnet in vpc.private_subnets]
