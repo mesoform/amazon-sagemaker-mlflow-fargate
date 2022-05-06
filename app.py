@@ -10,22 +10,31 @@ from aws_cdk import (
     aws_secretsmanager as sm,
     aws_ecs_patterns as ecs_patterns,
     aws_elasticloadbalancingv2 as elbv2,
+    aws_sagemaker as sagemaker,
     App, Stack, CfnParameter, CfnOutput, Aws, RemovalPolicy, Duration
 )
 from constructs import Construct
+from datetime import datetime
+import os
+import boto3
 
 
 class DeploymentStack(Stack):
-    def __init__(self, scope: Construct, id: str, **kwargs) -> None:
-        super().__init__(scope, id, **kwargs)
+    export_vpc: ec2.Vpc
+    export_sg: ec2.SecurityGroup
+
+    def __init__(self, scope: Construct, stack_id: str, **kwargs) -> None:
+        super().__init__(scope, stack_id, **kwargs)
         # ==============================
         # ======= CFN PARAMETERS =======
         # ==============================
-        project_name_param = CfnParameter(scope=self, id='ProjectName', type='String')
+        environment = CfnParameter(scope=self, id='Environment', type='String', default='mlflow')
+        access_ips = os.getenv('MLFLOW_ACCESS_IPS').split(',') if 'MLFLOW_ACCESS_IPS' in os.environ else []
         db_name = 'mlflowdb'
         port = 3306
         username = 'master'
-        bucket_name = f'{project_name_param.value_as_string}-artifacts-{Aws.ACCOUNT_ID}'
+        account_id = boto3.client('sts').get_caller_identity()['Account']
+        bucket_name = f'mlflow-artifacts-{account_id}'
         container_repo_name = 'mlflow-containers'
         cluster_name = 'mlflow'
         service_name = 'mlflow'
@@ -51,20 +60,25 @@ class DeploymentStack(Stack):
         # ==================== VPC =========================
         # ==================================================
         public_subnet = ec2.SubnetConfiguration(name='Public', subnet_type=ec2.SubnetType.PUBLIC, cidr_mask=28)
-        private_subnet = ec2.SubnetConfiguration(
-            name='Private',
-            subnet_type=ec2.SubnetType.PRIVATE_WITH_NAT,
-            cidr_mask=26)
+        private_subnet = ec2.SubnetConfiguration(name='Private', subnet_type=ec2.SubnetType.PRIVATE_WITH_NAT, cidr_mask=28)
         isolated_subnet = ec2.SubnetConfiguration(name='DB', subnet_type=ec2.SubnetType.PRIVATE_ISOLATED, cidr_mask=28)
+
+        nat_eip = ec2.CfnEIP(self, "VPCNATPublicIP", domain="vpc")
+        nat_eip_allocation_id = nat_eip.attr_allocation_id
+        self.export_eip_allocation_id = nat_eip_allocation_id
+        nat_gateway = ec2.NatProvider.gateway(eip_allocation_ids=[nat_eip_allocation_id])
 
         vpc = ec2.Vpc(
             scope=self,
             id='VPC',
             cidr='10.0.0.0/24',
             max_azs=2,
+            nat_gateway_provider=nat_gateway,
             nat_gateways=1,
             subnet_configuration=[public_subnet, private_subnet, isolated_subnet]
         )
+
+        self.export_vpc = vpc
 
         # ==================================================
         # ==================== Sagemaker Config =========================
@@ -74,19 +88,26 @@ class DeploymentStack(Stack):
         sg_sagemaker.add_ingress_rule(peer=ec2.Peer.ipv4('10.0.0.0/24'), connection=ec2.Port.tcp(2049))
         # All TCP traffic within security group
         sg_sagemaker.add_ingress_rule(peer=sg_sagemaker, connection=ec2.Port.all_tcp())
+        sg_sagemaker.add_ingress_rule(peer=ec2.Peer.ipv4('10.0.0.0/24'), connection=ec2.Port.tcp(80))
+        self.export_sg = sg_sagemaker
 
         vpc.add_gateway_endpoint('S3Endpoint', service=ec2.GatewayVpcEndpointAwsService.S3)
-
         # ==================================================
         # ================= S3 BUCKET ======================
         # ==================================================
-        artifact_bucket = s3.Bucket(
-            scope=self,
-            id='ARTIFACTBUCKET',
-            bucket_name=bucket_name,
-            public_read_access=False,
-            encryption=s3.BucketEncryption.KMS_MANAGED
-        )
+        s3_client = boto3.client('s3')
+        buckets = s3_client.list_buckets()['Buckets']
+        if len([bucket for bucket in buckets if bucket['Name'] == bucket_name]) > 0:
+            artifact_bucket = s3.Bucket.from_bucket_name(scope=self, id='ARTIFACTBUCKET',
+                                                         bucket_name=bucket_name)
+        else:
+            artifact_bucket = s3.Bucket(
+                    scope=self,
+                    id='ARTIFACTBUCKET',
+                    bucket_name=bucket_name,
+                    public_read_access=False,
+                    encryption=s3.BucketEncryption.KMS_MANAGED
+                )
         # # ==================================================
         # # ================== DATABASE  =====================
         # # ==================================================
@@ -105,7 +126,7 @@ class DeploymentStack(Stack):
             instance_type=ec2.InstanceType.of(ec2.InstanceClass.BURSTABLE2, ec2.InstanceSize.SMALL),
             vpc=vpc,
             security_groups=[sg_rds],
-            vpc_subnets=ec2.SubnetSelection(subnet_group_name='DB'),
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
             # multi_az=True,
             removal_policy=RemovalPolicy.DESTROY,
             deletion_protection=False
@@ -139,19 +160,28 @@ class DeploymentStack(Stack):
         port_mapping = ecs.PortMapping(container_port=5000, host_port=5000, protocol=ecs.Protocol.TCP)
         container.add_port_mappings(port_mapping)
 
-        vpc_subnets = ec2.SubnetSelection(subnet_group_name=private_subnet.name, one_per_az=True)
+        sg_ui = ec2.SecurityGroup(scope=self, id='SGMLFLOWUI', vpc=vpc, security_group_name='sg_mlfow_ui')
 
-        lb = elbv2.NetworkLoadBalancer(scope=self, id="MLFLOWInternalLB", vpc=vpc, vpc_subnets=vpc_subnets)
+        for ip in access_ips:
+            sg_ui.add_ingress_rule(peer=ec2.Peer.ipv4(f'{ip}/32'), connection=ec2.Port.tcp(80))
+        sg_ui.add_ingress_rule(peer=ec2.Peer.ipv4(f'{nat_eip.ref}/32'), connection=ec2.Port.tcp(80))
 
-        fargate_service = ecs_patterns.NetworkLoadBalancedFargateService(
+        lb = elbv2.ApplicationLoadBalancer(
+            scope=self,
+            id="MLFLOWAppLB",
+            vpc=vpc,
+            internet_facing=True,
+            security_group=sg_ui
+        )
+        fargate_service = ecs_patterns.ApplicationLoadBalancedFargateService(
             scope=self,
             id='MLFLOW',
             service_name=service_name,
             cluster=cluster,
+            security_groups=[sg_ui, sg_sagemaker],
             task_definition=task_definition,
             load_balancer=lb,
-            task_subnets=vpc_subnets,
-            public_load_balancer=False
+            open_listener=False
         )
 
         # Setup security group
@@ -161,7 +191,7 @@ class DeploymentStack(Stack):
             description='Allow inbound from VPC for mlflow'
         )
 
-        fargate_service.service.connections.security_groups.append(sg_sagemaker)
+        fargate_service.service.connections.security_groups.extend([sg_sagemaker, sg_ui])
 
         # Setup autoscaling policy
         scaling = fargate_service.service.auto_scale_task_count(max_capacity=2)
@@ -175,8 +205,60 @@ class DeploymentStack(Stack):
         # =================== OUTPUTS ======================
         # ==================================================
         CfnOutput(scope=self, id='LoadBalancerDNS', value=fargate_service.load_balancer.load_balancer_dns_name)
+        CfnOutput(scope=self, id='NATGatewayEIP', value=nat_eip.ref)
+
+
+class SagemakerStack(Stack):
+    def __init__(self, scope: Construct, stack_id: str, vpc: ec2.Vpc, security_group: ec2.SecurityGroup, **kwargs) -> None:
+        super().__init__(scope, stack_id, **kwargs)
+        environment = CfnParameter(scope=self, id='Environment', type='String', default='mlflow')
+        auth_mode = "SSO"
+        subnet_ids = [subnet.subnet_id for subnet in vpc.private_subnets]
+        security_groups = [security_group.security_group_id]
+        iam_client = boto3.client('iam')
+        roles = iam_client.list_roles()['Roles']
+        sagemaker_roles = [role for role in roles if 'SageMaker' in role['RoleName']]
+        execution_roles = [role for role in sagemaker_roles if 'ExecutionRole' in role['RoleName']]
+        if len(execution_roles) > 0:
+            execution_role = iam.Role.from_role_arn(self, id='SM_EXECUTION_ROLE', role_arn=execution_roles[0]['Arn'])
+        else:
+            execution_policy_document = iam.PolicyDocument(
+                statements=[
+                    iam.PolicyStatement(
+                        actions=["s3:ListBucket"],
+                        resources=["arn:aws:s3:::SageMaker"]
+                    ),
+                    iam.PolicyStatement(
+                        actions=["s3.GetObject", "s3:PutObject", "s3:DeleteObject"],
+                        resources=["arn:aws:s3:::SageMaker/*"]
+                    )
+                ]
+            )
+            managed_policy = iam.ManagedPolicy.from_managed_policy_arn("arn:aws:iam::aws:policy/AmazonSageMakerFullAccess")
+            execution_role = iam.Role(self, id='SM_EXECUTION_ROLE', inline_policies=execution_policy_document,
+                                      managed_policies=managed_policy,
+                                      role_name=f'AmazonSageMaker-ExecutionRole-{datetime.now().strftime("%y%m%d%H%M%S")}')
+        user_settings_property = sagemaker.CfnDomain.UserSettingsProperty(
+            security_groups=security_groups,
+            execution_role=execution_role.role_arn
+        )
+        app_network_access_type = "VpcOnly"
+        vpc_id = vpc.vpc_id
+        cfn_domain = sagemaker.CfnDomain(scope=self, id="SagemakerDomain",
+                                         auth_mode=auth_mode,
+                                         default_user_settings=user_settings_property,
+                                         domain_name=environment.value_as_string,
+                                         subnet_ids=subnet_ids,
+                                         vpc_id=vpc_id,
+                                         app_network_access_type=app_network_access_type,
+                                         domain_settings=sagemaker.CfnDomain.DomainSettingsProperty(
+                                             security_group_ids=security_groups)
+                                         )
+        CfnOutput(scope=self, id='Sagemaker Domain Name', value=cfn_domain.domain_name)
+        CfnOutput(scope=self, id='Sagemaker Domain ID', value=cfn_domain.attr_domain_id)
 
 
 app = App()
-DeploymentStack(app, "MLFlowDeploymentStack")
+mlflow = DeploymentStack(app, "MLFlowDeploymentStack")
+SagemakerStack(app, "SagemakerStudioStack", vpc=mlflow.export_vpc, security_group=mlflow.export_sg)
 app.synth()
